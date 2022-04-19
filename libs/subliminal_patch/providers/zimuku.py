@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
+
+import asyncio
 import io
 import logging
 import os
 import zipfile
 import re
-import copy
 
 try:
     from urlparse import urljoin
@@ -18,20 +19,19 @@ from subzero.language import Language
 from guessit import guessit
 from requests import Session
 from six import text_type
-from random import randint
 
 from subliminal.providers import ParserBeautifulSoup
 from subliminal_patch.providers import Provider
 from subliminal.subtitle import (
     SUBTITLE_EXTENSIONS,
     fix_line_ending
-    )
+)
 from subliminal_patch.subtitle import (
     Subtitle,
     guess_matches
 )
-from .utils import FIRST_THOUSAND_OR_SO_USER_AGENTS as AGENT_LIST
 from subliminal.video import Episode, Movie
+import pyppeteer
 
 logger = logging.getLogger(__name__)
 
@@ -39,18 +39,21 @@ language_converters.register('zimuku = subliminal_patch.converters.zimuku:zimuku
 
 supported_languages = list(language_converters['zimuku'].to_zimuku.keys())
 
+browserless_ws_endpoint = 'ws://chrome:3000'
+browserless_http_endpoint = 'http://chrome:3000'
+
+
 class ZimukuSubtitle(Subtitle):
     """Zimuku Subtitle."""
 
     provider_name = "zimuku"
 
-    def __init__(self, language, page_link, version, session, year):
+    def __init__(self, language, page_link, version, year):
         super(ZimukuSubtitle, self).__init__(language, page_link=page_link)
         self.version = version
         self.release_info = version
         self.hearing_impaired = False
         self.encoding = "utf-8"
-        self.session = session
         self.year = year
 
     @property
@@ -95,18 +98,39 @@ class ZimukuProvider(Provider):
 
     def __init__(self):
         self.session = None
+        self.loop = asyncio.new_event_loop()
 
     def initialize(self):
         self.session = Session()
-        self.session.headers["User-Agent"] = AGENT_LIST[randint(0, len(AGENT_LIST) - 1)]
 
     def terminate(self):
-        self.session.close()
+        self.loop.close()
+
+    async def _browser_async(self, link, wait_for_navigation=True):
+        browser = await pyppeteer.connect({'browserWSEndpoint': browserless_ws_endpoint})
+        page = await browser.newPage()
+        response = await page.goto(link)
+        self.headers = response.headers
+        if wait_for_navigation:
+            await page.waitForNavigation()
+            self.content = await page.content()
+        else:
+            self.buffer = await response.buffer()
+            await page.waitFor(12000)  # No way to tell if download finished. Just wait a fairly long time.
+        await browser.close()
+
+    def _get(self, link):
+        asyncio.run(self._browser_async(link))
+        return self.content
+
+    def _download(self, link):
+        asyncio.run(self._browser_async(link, wait_for_navigation=False))
+        return self.headers, self.buffer
 
     def _parse_episode_page(self, link, year):
-        r = self.session.get(link)
+        html = self._get(link)
         bs_obj = ParserBeautifulSoup(
-            r.content.decode("utf-8", "ignore"), ["html.parser"]
+            html, ["html.parser"]
         )
         subs_body = bs_obj.find("div", class_="subs box clearfix").find("tbody")
         subs = []
@@ -120,25 +144,23 @@ class ZimukuProvider(Provider):
             language = Language("eng")
             for img in sub.find("td", class_="tac lang").find_all("img"):
                 if (
-                    "china" in img.attrs["src"]
-                    and "hongkong" in img.attrs["src"]
-                    ):
+                        "china" in img.attrs["src"]
+                        and "hongkong" in img.attrs["src"]
+                ):
                     language = Language("zho").add(Language('zho', 'TW', None))
-                    logger.debug("language:"+str(language))
-                elif (                    
-                    "china" in img.attrs["src"]
-                    or "jollyroger" in img.attrs["src"]
+                    logger.debug("language:" + str(language))
+                elif (
+                        "china" in img.attrs["src"]
+                        or "jollyroger" in img.attrs["src"]
                 ):
                     language = Language("zho")
                 elif "hongkong" in img.attrs["src"]:
-                    language =  Language('zho', 'TW', None)
+                    language = Language('zho', 'TW', None)
                     break
             sub_page_link = urljoin(self.server_url, a.attrs["href"])
-            backup_session = copy.deepcopy(self.session)
-            backup_session.headers["Referer"] = link
 
             subs.append(
-                self.subtitle_class(language, sub_page_link, name, backup_session, year)
+                self.subtitle_class(language, sub_page_link, name, year)
             )
 
         return subs
@@ -154,14 +176,8 @@ class ZimukuProvider(Provider):
         subtitles = []
         search_link = self.server_url + text_type(self.search_url).format(params)
 
-        r = self.session.get(search_link, timeout=30)
-        r.raise_for_status()
+        html = self._get(search_link)
 
-        if not r.content:
-            logger.debug("No data returned from provider")
-            return []
-
-        html = r.content.decode("utf-8", "ignore")
         # parse window location
         pattern = r"url\s*=\s*'([^']*)'\s*\+\s*url"
         parts = re.findall(pattern, html)
@@ -169,13 +185,12 @@ class ZimukuProvider(Provider):
         while parts:
             parts.reverse()
             redirect_url = urljoin(self.server_url, "".join(parts))
-            r = self.session.get(redirect_url, timeout=30)
-            html = r.content.decode("utf-8", "ignore")
+            html = self._get(redirect_url)
             parts = re.findall(pattern, html)
         logger.debug("search url located: " + redirect_url)
 
         soup = ParserBeautifulSoup(
-            r.content.decode("utf-8", "ignore"), ["lxml", "html.parser"]
+            html, ["lxml", "html.parser"]
         )
 
         # non-shooter result page
@@ -237,40 +252,59 @@ class ZimukuProvider(Provider):
 
         return subtitles
 
-    def download_subtitle(self, subtitle):
-        def _get_archive_dowload_link(session, sub_page_link):
-            r = session.get(sub_page_link)
-            bs_obj = ParserBeautifulSoup(
-                r.content.decode("utf-8", "ignore"), ["html.parser"]
-            )
-            down_page_link = bs_obj.find("a", {"id": "down1"}).attrs["href"]
-            down_page_link = urljoin(sub_page_link, down_page_link)
-            r = session.get(down_page_link)
-            bs_obj = ParserBeautifulSoup(
-                r.content.decode("utf-8", "ignore"), ["html.parser"]
-            )
-            download_link = bs_obj.find("a", {"rel": "nofollow"})
-            download_link = download_link.attrs["href"]
-            download_link = urljoin(sub_page_link, download_link)
-            return download_link
+    def _get_archive_dowload_link(self, sub_page_link):
+        html = self._get(sub_page_link)
+        bs_obj = ParserBeautifulSoup(
+            html, ["html.parser"]
+        )
+        down_page_link = bs_obj.find("a", {"id": "down1"}).attrs["href"]
+        down_page_link = urljoin(sub_page_link, down_page_link)
+        html = self._get(down_page_link)
+        bs_obj = ParserBeautifulSoup(
+            html, ["html.parser"]
+        )
+        download_link = bs_obj.find("a", {"rel": "nofollow"})
+        download_link = download_link.attrs["href"]
+        download_link = urljoin(sub_page_link, download_link)
+        return download_link
 
+    def download_subtitle(self, subtitle):
         # download the subtitle
         logger.info("Downloading subtitle %r", subtitle)
-        self.session = subtitle.session
-        download_link = _get_archive_dowload_link(self.session, subtitle.page_link)
-        r = self.session.get(download_link, headers={'Referer': subtitle.page_link}, timeout=30)
-        r.raise_for_status()
+
+        # clear existing downloads
+        workspace = self.session.get(urljoin(browserless_http_endpoint, '/workspace'))
+        result = workspace.json()
+        for existOne in result:
+            self.session.delete(urljoin(browserless_http_endpoint, existOne['path']))
+
+        workspace = self.session.get(urljoin(browserless_http_endpoint, '/workspace'))
+        result = workspace.json()
+        if len(result) != 0:
+            logger.warning("Unable to clean browser download history")
+            raise Exception('Unable to clean browser download history')
+
+        download_link = self._get_archive_dowload_link(subtitle.page_link)
+        self._download(download_link)
+
+        workspace = self.session.get(urljoin(browserless_http_endpoint, '/workspace'))
+        result = workspace.json()
+        if len(result) != 1:
+            logger.debug("Unable to download subtitle: {}".format(subtitle))
+            return
+
         try:
-            filename = r.headers["Content-Disposition"]
+            filename = result[0]['name'].lower()
         except KeyError:
             logger.debug("Unable to parse subtitles filename. Dropping this subtitles.")
             return
 
-        if not r.content:
+        dl = self.session.get(urljoin(browserless_http_endpoint, result[0]['path']))
+        if not dl.content:
             logger.debug("Unable to download subtitle. No data returned from provider")
             return
 
-        archive_stream = io.BytesIO(r.content)
+        archive_stream = io.BytesIO(dl.content)
         archive = None
         if rarfile.is_rarfile(archive_stream):
             logger.debug("Identified rar archive")
@@ -302,7 +336,7 @@ class ZimukuProvider(Provider):
                 )
                 return
             logger.debug("Identified {} file".format(is_sub))
-            subtitle_content = r.content
+            subtitle_content = dl.content
 
         if subtitle_content:
             subtitle.content = fix_line_ending(subtitle_content)
@@ -375,7 +409,7 @@ def _extract_name(name):
                 result = [start, end]
             start = end
             end += 1
-        new_name = name[result[0] : result[1]]
+        new_name = name[result[0]: result[1]]
     new_name = new_name.strip() + suffix
     return new_name
 
